@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  # 1. База метаданных и pgvector
+  postgres_db:
+    image: ankane/pgvector:latest
+    container_name: r_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. Аналитическая база логов
+  clickhouse_db:
+    image: clickhouse/clickhouse-server:latest
+    container_name: r_clickhouse
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "${CLICKHOUSE_PORT_HTTP}:8123"
+      - "${CLICKHOUSE_PORT_NATIVE}:9000"
+    volumes:
+      - chdata:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # 3. Сервис Онлайн-Ранжирования (FastAPI)
+  ranking_service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: r_ranking_fastapi
+    restart: always
+    env_file: .env
+    command: uvicorn ranking_service.main:app --host 0.0.0.0 --port 8080
+    ports:
+      - "${SERVER_PORT}:8080"
+    environment:
+      # Имена должны строго совпадать с переменными ServerSettings из main.py!
+      - POSTGRES_HOST=postgres_db
+      - CLICKHOUSE_HOST=clickhouse_db
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+
+  # 4. Внешний генератор трафика (Симулятор)
+  traffic_simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: r_traffic_sim
+    restart: always
+    env_file: .env
+    command: python init_data/simulate_traffic.py
+    environment:
+      - POSTGRES_HOST=postgres_db
+      - CLICKHOUSE_HOST=clickhouse_db
+      - SERVER_HOST=ranking_service
+      - SERVER_PORT=8080
+    depends_on:
+      - ranking_service
+
+  # 5. Планировщик офлайн-обучения (Cron)
+  offline_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: r_offline_worker
+    restart: always # <-- ДОБАВИЛИ
+    command: sh -c "crontab train_service/crontab && cron -f"
+    environment:
+      - POSTGRES_HOST=postgres_db
+      - CLICKHOUSE_HOST=clickhouse_db
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  chdata:
