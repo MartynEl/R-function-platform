@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Устанавливаем системные утилиты для сборки С-библиотек (нужно для psycopg2 и clickhouse)
+# Устанавливаем системные утилиты
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
@@ -9,12 +9,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Копируем и устанавливаем общие зависимости
+# Копируем зависимости
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем весь исходный код проекта в контейнер
+# Увеличиваем тайм-аут до 1000 секунд для скачивания тяжелого PyTorch
+RUN pip install --no-cache-dir --default-timeout=1000 -r requirements.txt
+
+# Копируем исходный код
 COPY . .
 
-# По умолчанию контейнер ничего не делает, команду мы переопределим в docker-compose
 CMD ["python"]
+

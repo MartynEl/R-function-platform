@@ -1,30 +1,30 @@
 import os
 import sys
-from dotenv import load_dotenv
-import psycopg2
-
-# Фиксируем окружение ОС до импорта torch
-load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
+import logging
 import torch
 import torch.nn as nn
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import uvicorn
-import logging
 from clickhouse_driver import Client
+from dotenv import load_dotenv
+
+# ИМПОРТ МИЛВУСА
+from pymilvus import MilvusClient
+
+# Фиксируем окружение ОС до импорта torch
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 # --- 1. НАСТРОЙКА ЛОГИРОВАНИЯ ---
-logging.basicConfig(level=logging.INFO, format="INFO:     %(message)s")
+logging.basicConfig(level=logging.INFO, format="INFO: %(message)s")
 logger = logging.getLogger("app")
 
 
 # --- 2. НАСТРОЙКИ СЕРВЕРА ---
 class ServerSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
-
     model_num_users: int = 1000
     model_num_items: int = 500
     model_embedding_dim: int = 16
@@ -32,25 +32,46 @@ class ServerSettings(BaseSettings):
     server_host: str = "127.0.0.1"
     server_port: int = 8080
 
-    # СУБД параметры
-    postgres_host: str = "127.0.0.1"
-    postgres_port: int = 5432
-    postgres_user: str = "martin"
-    postgres_password: str = "my_very_secure_password_123"
-    postgres_db: str = "r_platform_db"
-
+    # СУБД параметры (Postgres полностью убран)
     clickhouse_host: str = "127.0.0.1"
     clickhouse_port_native: int = 9000
     clickhouse_user: str = "martin"
     clickhouse_password: str = "clickhouse_secure_pass_789"
     clickhouse_db: str = "r_analytics_db"
 
+    # Путь к локальному файлу базы Milvus Lite
+    milvus_db_path: str = "./milvus_pro_demo.db"
+
 
 settings = ServerSettings()
 device = torch.device(settings.model_device)
 
+# --- 3. ИНИЦИАЛИЗАЦИЯ MILVUS LITE С КОРРЕКТНЫМ СИНТАКСИСОМ ---
+milvus_client = MilvusClient(settings.milvus_db_path)
 
-# --- 3. МАТЕМАТИКА РВАЧЁВА И МОДЕЛЬ ---
+# Автоматически создаем коллекции, если сервер стартует в чистом окружении
+if not milvus_client.has_collection("users"):
+    schema_u = MilvusClient.create_schema(auto_id=False)
+    schema_u.add_field(field_name="user_id", datatype=DataType.INT64, is_primary=True)
+    schema_u.add_field(field_name="embedding", datatype=DataType.FLOAT_VECTOR, dim=settings.model_embedding_dim)
+    milvus_client.create_collection(collection_name="users", schema=schema_u)
+
+if not milvus_client.has_collection("movies"):
+    schema_m = MilvusClient.create_schema(auto_id=False)
+    schema_m.add_field(field_name="movie_id", datatype=DataType.INT64, is_primary=True)
+    schema_m.add_field(field_name="title", datatype=DataType.VARCHAR, max_length=255)
+    schema_m.add_field(field_name="age_rating", datatype=DataType.INT64)
+    schema_m.add_field(field_name="embedding", datatype=DataType.FLOAT_VECTOR, dim=settings.model_embedding_dim)
+
+    index_params = milvus_client.prepare_index_params()
+    index_params.add_index(field_name="embedding", metric_type="COSINE", index_type="FLAT")
+    milvus_client.create_collection(collection_name="movies", schema=schema_m, index_params=index_params)
+
+milvus_client.load_collection("users")
+milvus_client.load_collection("movies")
+logger.info("Коллекции Milvus успешно загружены в оперативную память!")
+
+# --- 4. МАТЕМАТИКА РВАЧЁВА И МОДЕЛЬ ---
 class RFunctionIntersection(nn.Module):
     def forward(self, x, y):
         return x + y - torch.sqrt(x ** 2 + y ** 2 + 1e-8)
@@ -64,7 +85,6 @@ class RFactorizationMachine(nn.Module):
         self.user_emb = nn.Embedding(num_users, embedding_dim)
         self.item_emb = nn.Embedding(num_items, embedding_dim)
         self.r_and = RFunctionIntersection()
-
         nn.init.xavier_uniform_(self.user_emb.weight)
         nn.init.xavier_uniform_(self.item_emb.weight)
         nn.init.zeros_(self.user_bias.weight)
@@ -75,16 +95,13 @@ class RFactorizationMachine(nn.Module):
         i_b = self.item_bias(item_ids).squeeze(-1)
         u_e = self.user_emb(user_ids)
         i_e = self.item_emb(item_ids)
-
         interaction = torch.sum(u_e * i_e, dim=-1) * duration_ratios
         f_fm = u_b + i_b + interaction
-
         f_r = self.r_and(constraint_g1, constraint_g2)
         f_total = self.r_and(f_fm, f_r)
         return f_total
 
 
-# Инициализируем каркас модели
 model = RFactorizationMachine(
     num_users=settings.model_num_users,
     num_items=settings.model_num_items,
@@ -92,51 +109,38 @@ model = RFactorizationMachine(
 ).to(device)
 
 
-# --- 4. ПОДГРУЗКА ЭМБЕДДИНГОВ ИЗ PGVECTOR ---
-def load_embeddings_from_postgres(model_instance):
-    """ Подключается к Postgres и заменяет случайные веса фильма обученными векторами """
-    logger.info("Синхронизация весов модели с pgvector из PostgreSQL...")
+# --- 5. СИНХРОНИЗАЦИЯ МОДЕЛИ С MILVUS LITE ---
+def load_embeddings_from_milvus(model_instance):
+    """ Накатывает обученные векторы из Milvus Lite в инференс-модель PyTorch """
+    logger.info("Синхронизация весов модели с хранилищем Milvus Lite...")
     try:
-        conn = psycopg2.connect(
-            host=settings.postgres_host,
-            port=settings.postgres_port,
-            user=settings.postgres_user,
-            password=settings.postgres_password,
-            database=settings.postgres_db
-        )
-        with conn.cursor() as cur:
-            # Вытягиваем ID фильма и его текстовое представление вектора (pgvector возвращает '[x1,x2,...]')
-            cur.execute("SELECT movie_id, embedding::text FROM movies WHERE embedding IS NOT NULL;")
-            rows = cur.fetchall()
-
-        if not rows:
-            logger.info("В базе PostgreSQL пока нет обученных эмбеддингов. Используются случайные веса.")
-            conn.close()
-            return
-
-        # Отключаем градиенты PyTorch для безопасного изменения весов «на лету»
         with torch.no_grad():
-            loaded_count = 0
-            for movie_id, emb_str in rows:
-                if movie_id >= settings.model_num_items:
-                    continue
-                # Парсим строку '[0.1, 0.2, ...]' в список float
-                emb_list = [float(x) for x in emb_str.strip("[]").split(",")]
-                # Записываем тензор прямо в матрицу эмбеддингов модели
-                model_instance.item_emb.weight[movie_id] = torch.tensor(emb_list, dtype=torch.float, device=device)
-                loaded_count += 1
+            # Загружаем фильмы
+            movie_res = milvus_client.query(collection_name="movies", filter="movie_id >= 0",
+                                            output_fields=["movie_id", "embedding"], limit=settings.model_num_items)
+            for item in movie_res:
+                mid = item["movie_id"]
+                if "embedding" in item and mid < settings.model_num_items:
+                    model_instance.item_emb.weight[mid] = torch.tensor(item["embedding"], dtype=torch.float,
+                                                                       device=device)
 
-        logger.info(f"Синхронизация завершена! Успешно загружено {loaded_count} векторов из pgvector.")
-        conn.close()
+            # Загружаем пользователей
+            user_res = milvus_client.query(collection_name="users", filter="user_id >= 0",
+                                           output_fields=["user_id", "embedding"], limit=settings.model_num_users)
+            for item in user_res:
+                uid = item["user_id"]
+                if "embedding" in item and uid < settings.model_num_users:
+                    model_instance.user_emb.weight[uid] = torch.tensor(item["embedding"], dtype=torch.float,
+                                                                       device=device)
+            logger.info("Синхронизация с Milvus завершена успешно!")
     except Exception as e:
-        logger.error(f"Не удалось подтянуть веса из Postgres: {e}. Работаем на базовой инициализации.")
+        logger.error(f"Не удалось подтянуть веса из Milvus: {e}. Работаем на базовой инициализации.")
 
 
-# Запускаем загрузку векторов в модель перед стартом API
-load_embeddings_from_postgres(model)
+load_embeddings_from_milvus(model)
 model.eval()
 
-# --- 5. ПОДКЛЮЧЕНИЕ К CLICKHOUSE ДЛЯ ОНЛАЙН-ЛОГОВ ---
+# --- 6. ПОДКЛЮЧЕНИЕ К CLICKHOUSE ДЛЯ ОНЛАЙН-ЛОГОВ ---
 ch_client = Client(
     host=settings.clickhouse_host,
     port=settings.clickhouse_port_native,
@@ -146,7 +150,7 @@ ch_client = Client(
 )
 
 
-# --- 6. СХЕМЫ ДАННЫХ API ---
+# --- 7. СХЕМЫ ДАННЫХ API ---
 class RecommendationRequest(BaseModel):
     user_id: int = Field(..., ge=0)
     item_id: int = Field(..., ge=0)
@@ -175,8 +179,8 @@ def log_watch_event_to_clickhouse(user_id: int, movie_id: int, duration_ratio: f
         logger.error(f"Не удалось записать лог в ClickHouse: {e}")
 
 
-# --- 7. СЕРВИС FASTAPI ---
-app = FastAPI(title="R-Function Live Recommendation Platform")
+# --- 8. СЕРВИС FASTAPI ---
+app = FastAPI(title="R-Function Live Recommendation Platform [PRO VERSION]")
 
 
 @app.post("/predict", response_model=RecommendationResponse)
@@ -198,19 +202,15 @@ def predict_score(request: RecommendationRequest, background_tasks: BackgroundTa
     status = "Approved" if is_safe else "Blocked by R-Function Constraint"
 
     background_tasks.add_task(log_watch_event_to_clickhouse, request.user_id, request.item_id, request.duration_ratio)
-
-    return RecommendationResponse(
-        user_id=request.user_id, item_id=request.item_id,
-        score=score, is_safe=is_safe, status=status
-    )
+    return RecommendationResponse(user_id=request.user_id, item_id=request.item_id, score=score, is_safe=is_safe,
+                                  status=status)
 
 
-# --- ДОПОЛНИТЕЛЬНАЯ СХЕМА ОТВЕТА ДЛЯ ЭТАПА А ---
 class CandidateMovie(BaseModel):
     movie_id: int
     title: str
     age_rating: int
-    distance: float  # Косинусное расстояние (чем меньше, тем ближе вкус)
+    distance: float
 
 
 class TopRecommendationsResponse(BaseModel):
@@ -218,53 +218,46 @@ class TopRecommendationsResponse(BaseModel):
     recommendations: list[CandidateMovie]
 
 
-# --- НОВЫЙ ЭНДПОИНТ: ЭТАП А (CANDIDATE GENERATION) ---
+# --- ЭТАП А: ОНЛАЙН-ПОИСК КАНДИДАТОВ ЧЕРЕЗ MILVUS LITE ---
 @app.get("/recommend", response_model=TopRecommendationsResponse)
 def get_top_candidates(user_id: int):
-    """ Находит топ-20 лучших фильмов для юзера прямо внутри БД через pgvector """
     try:
-        conn = psycopg2.connect(
-            host=settings.postgres_host, port=settings.postgres_port,
-            user=settings.postgres_user, password=settings.postgres_password,
-            database=settings.postgres_db
+        user_res = milvus_client.get(collection_name="users", ids=[user_id], output_fields=["embedding"])
+        if not user_res:
+            raise HTTPException(status_code=404, detail="Вектор пользователя не найден в Milvus.")
+
+        # Безопасное извлечение вектора (обработка списков и словарей от Milvus Client)
+        if isinstance(user_res, list) and len(user_res) > 0:
+            user_vector = user_res[0]["embedding"]
+        else:
+            user_vector = user_res["embedding"]
+
+        # Нативный векторный поиск по индексу COSINE
+        search_res = milvus_client.search(
+            collection_name="movies", data=[user_vector], limit=20,
+            output_fields=["title", "age_rating", "movie_id"]
         )
-        with conn.cursor() as cur:
-            # 1. Получаем вектор самого пользователя
-            cur.execute("SELECT embedding FROM users WHERE user_id = %s AND embedding IS NOT NULL;", (user_id,))
-            user_row = cur.fetchone()
 
-            if not user_row:
-                # Если пользователя нет или он еще не обучен (Cold Start)
-                raise HTTPException(status_code=404, detail="Вектор пользователя не найден. Сначала обучите модель.")
-
-            user_embedding_str = user_row[0]  # возвращает строку '[x1, x2, ...]'
-
-            # 2. МАГИЯ PGVECTOR: Ищем топ-20 фильмов по косинусному расстоянию (<=>)
-            cur.execute("""
-                        SELECT movie_id, title, age_rating, (embedding <=> %s) as distance
-                        FROM movies
-                        WHERE embedding IS NOT NULL
-                        ORDER BY embedding <=> %s
-                            LIMIT 20;
-                        """, (user_embedding_str, user_embedding_str))
-
-            movie_rows = cur.fetchall()
-
-        conn.close()
-
-        # Формируем красивый список кандидатов
-        candidates = [
-            CandidateMovie(movie_id=row[0], title=row[1], age_rating=row[2], distance=float(row[3]))
-            for row in movie_rows
-        ]
-
+        candidates = []
+        if search_res:
+            # MilvusClient возвращает список батчей, берем первый батч результатов
+            hits = search_res[0] if isinstance(search_res[0], list) else search_res
+            for hit in hits:
+                entity = hit.get("entity", {})
+                m_id = entity.get("movie_id", hit.get("id"))
+                candidates.append(CandidateMovie(
+                    movie_id=int(m_id),
+                    title=entity.get("title", f"Фильм {m_id}"),
+                    age_rating=entity.get("age_rating", 12),
+                    distance=float(hit.get("distance", 0.0))
+                ))
         return TopRecommendationsResponse(user_id=user_id, recommendations=candidates)
-
     except Exception as e:
-        logger.error(f"Ошибка Этапа А: {e}")
+        logger.error(f"Ошибка Этапа А в Milvus: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- КЛАССЫ СХЕМ ДАННЫХ ДЛЯ СМАРТ-ЛЕНТЫ ---
 class SmartFeedItem(BaseModel):
     movie_id: int
     title: str
@@ -277,85 +270,77 @@ class SmartFeedResponse(BaseModel):
     feed: list[SmartFeedItem]
 
 
+# --- ПОЛНЫЙ ДВУХЭТАПНЫЙ КОНВЕЙЕР (ЭТАП А В MILVUS -> ЭТАП Б В PYTORCH С R-ФУНКЦИЕЙ) ---
 @app.get("/smart-feed", response_model=SmartFeedResponse)
 def get_smart_feed(user_id: int, current_age: int):
-    """
-    ПОЛНЫЙ КОНВЕЙЕР:
-    Этап А (pgvector) -> Передача кандидатов -> Этап Б (FM + R-функция Рвачёва)
-    """
     try:
-        # --- ШАГ 1: ЭТАП А (Вытаскиваем 20 кандидатов по вкусу из БД) ---
-        conn = psycopg2.connect(
-            host=settings.postgres_host, port=settings.postgres_port,
-            user=settings.postgres_user, password=settings.postgres_password,
-            database=settings.postgres_db
+        # 1. Извлекаем вектор пользователя
+        user_res = milvus_client.get(collection_name="users", ids=[user_id], output_fields=["embedding"])
+        if not user_res:
+            raise HTTPException(status_code=404, detail="Вектор пользователя не найден в Milvus.")
+
+        if isinstance(user_res, list) and len(user_res) > 0:
+            user_vector = user_res[0]["embedding"]
+        else:
+            user_vector = user_res["embedding"]
+
+        # 2. Извлекаем 30 кандидатов по вкусу через Milvus
+        search_res = milvus_client.search(
+            collection_name="movies", data=[user_vector], limit=30,
+            output_fields=["title", "age_rating", "movie_id"]
         )
-        with conn.cursor() as cur:
-            cur.execute("SELECT embedding FROM users WHERE user_id = %s AND embedding IS NOT NULL;", (user_id,))
-            user_row = cur.fetchone()
-            if not user_row:
-                raise HTTPException(status_code=404, detail="Вектор пользователя не найден. Сначала обучите модель.")
 
-            user_emb_str = user_row
-
-            # Извлекаем кандидатов (берем чуть больше, например 30, так как R-функция часть отсеет)
-            cur.execute("""
-                        SELECT movie_id, title, age_rating
-                        FROM movies
-                        WHERE embedding IS NOT NULL
-                        ORDER BY embedding <=> %s
-                            LIMIT 30;
-                        """, (user_emb_str,))
-            candidates = cur.fetchall()
-        conn.close()
-
-        if not candidates:
+        if not search_res or len(search_res) == 0:
             return SmartFeedResponse(user_id=user_id, feed=[])
 
-        # --- ШАГ 2: ПОДГОТОВКА БАТЧА ДЛЯ ЭТАПА Б ---
-        # Формируем списки для пакетной обработки в PyTorch (батчинг)
-        movie_ids = [row[0] for row in candidates]
-        titles = {row[0]: row[1] for row in candidates}
-        ratings = {row[0]: row[2] for row in candidates}
+        hits = search_res[0] if isinstance(search_res[0], list) else search_res
+        if not hits:
+            return SmartFeedResponse(user_id=user_id, feed=[])
 
-        # Заполняем тензоры для всей пачки фильмов одновременно
+        # 3. Батчинг параметров для PyTorch модели (Этап Б) с учетом декларативного movie_id
+        movie_ids = []
+        titles = {}
+        ratings = {}
+
+        for hit in hits:
+            entity = hit.get("entity", {})
+            m_id = entity.get("movie_id", hit.get("id"))
+            if m_id is not None:
+                m_id = int(m_id)
+                movie_ids.append(m_id)
+                titles[m_id] = entity.get("title", f"Фильм {m_id}")
+                ratings[m_id] = entity.get("age_rating", 12)
+
         size = len(movie_ids)
+        if size == 0:
+            return SmartFeedResponse(user_id=user_id, feed=[])
+
         u_tensor = torch.tensor([user_id] * size, dtype=torch.long, device=device)
         i_tensor = torch.tensor(movie_ids, dtype=torch.long, device=device)
-        d_tensor = torch.tensor([1.0] * size, dtype=torch.float,
-                                device=device)  # Допустим, прогнозируем полный просмотр
+        d_tensor = torch.tensor([1.0] * size, dtype=torch.float, device=device)
 
-        # Считаем ограничения Рвачёва для каждого фильма: g1 = Возраст пользователя - Ценз фильма
+        # Ограничение R-функции: g1 = Возраст пользователя - Ценз фильма
         g1_tensor = torch.tensor([float(current_age - ratings[mid]) for mid in movie_ids], dtype=torch.float,
                                  device=device)
         g2_tensor = torch.tensor([1.0] * size, dtype=torch.float, device=device)
 
-        # --- ШАГ 3: ЭТАП Б (Плотное ранжирование + Рвачёв в PyTorch) ---
+        # 4. Скоринг и фильтрация Рвачёва в один матричный проход
         with torch.no_grad():
-            # Модель считает скоры для всех 30 фильмов ОДНИМ быстрым матричным ударом
             scores_tensor = model(u_tensor, i_tensor, d_tensor, g1_tensor, g2_tensor)
             scores = scores_tensor.cpu().numpy().tolist()
 
-        # --- ШАГ 4: ФОРМИРОВАНИЕ И СОРТИРОВКА ЛЕНТЫ ---
+        # 5. Сортировка выдачи
         feed_items = []
         for mid, score in zip(movie_ids, scores):
-            # Определяем статус на основе знака R-функции (если скор утянут глубоко вниз — значит Blocked)
             is_safe = current_age >= ratings[mid]
             status = "Approved" if is_safe else "Blocked by R-Function"
 
             feed_items.append(SmartFeedItem(
-                movie_id=mid,
-                title=titles[mid],
-                score=round(score, 4),
-                status=status
+                movie_id=mid, title=titles[mid], score=round(score, 4), status=status
             ))
 
-        # Сортируем ленту: Approved фильмы с высоким скором будут в самом верху, Blocked — улетят в конец
         feed_items.sort(key=lambda x: x.score, reverse=True)
-
-        # Возвращаем топ-20 выживших и отсортированных фильмов
         return SmartFeedResponse(user_id=user_id, feed=feed_items[:20])
-
     except Exception as e:
         logger.error(f"Ошибка умной ленты: {e}")
         raise HTTPException(status_code=500, detail=str(e))

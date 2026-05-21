@@ -1,0 +1,16 @@
+{
+  "active_wal_number": 2,
+  "current_seq": 1000,
+  "index_specs": {},
+  "manifest_format_version": 2,
+  "partitions": {
+    "_default": {
+      "data_files": [
+        "data/data_000001_001000.parquet"
+      ],
+      "delta_files": []
+    }
+  },
+  "schema_version": 1,
+  "version": 1
+}
